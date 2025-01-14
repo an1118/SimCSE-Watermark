@@ -145,8 +145,7 @@ def cl_forward(cls,
     for_watermark=True,  # TODO: these three parameters didn't pass
     lambda_1=1.0,
     lambda_2=1.0,
-    lambda_3=0.0,
-    lambda_4=0.0,
+    lambda_3=1.0,
 ):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
@@ -200,10 +199,10 @@ def cl_forward(cls,
         pooler_output = cls.mlp(pooler_output)
 
     if for_watermark:
+        # # Normalization before mapping
+        # pooler_output = F.normalize(pooler_output, p=2, dim=-1)
         # Mapping
-        mapping_output = cls.map(pooler_output)
-        # mapping_output = torch.tanh(mapping_output * 1000)  # approximate sign function
-        pooler_output = mapping_output
+        pooler_output = cls.map(pooler_output)
         
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
@@ -236,73 +235,40 @@ def cl_forward(cls,
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
 
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
-    # Hard negative
-    if num_sent >= 3:
-        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
-        cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)  # (bs, bs*2)
+    # calculate loss_1: loss for uniform perturbation and unbiased token preference
+    def sign_loss(x, factor):
+        smooth_sign = torch.tanh(x*factor)
+        row = torch.abs(torch.mean(torch.mean(smooth_sign, dim=0)))
+        col = torch.abs(torch.mean(torch.mean(smooth_sign, dim=1)))
+        return (row + col)/2
+    
+    loss_1 = sign_loss(z1, 1000)
 
-    labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    loss_fct = nn.CrossEntropyLoss()
+    # get sign value before calculating similarity
+    z1_sign = torch.tanh(z1 * 1000)
+    z2_sign = torch.tanh(z2 * 1000)
+    z3_sign = torch.tanh(z3 * 1000)
+    
+    # calculate loss_2: loss for distance between original and paraphrased text
+    loss_2 = torch.norm(z1_sign - z2_sign, dim=1)  # (bs)
+    loss_2 = torch.abs(loss_2).mean()
 
-    # Calculate loss with hard negatives
-    if num_sent == 3:
-        # Note that weights are actually logits of weights
-        z3_weight = cls.model_args.hard_negative_weight
-        weights = torch.tensor(
-            [[0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1)) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(-1))]
-        ).to(cls.device)
-        cos_sim = cos_sim + weights
-
-    loss = loss_fct(cos_sim, labels)
-
-    # Calculate loss for MLM
-    if mlm_outputs is not None and mlm_labels is not None:
-        mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
-        prediction_scores = cls.lm_head(mlm_outputs.last_hidden_state)
-        masked_lm_loss = loss_fct(prediction_scores.view(-1, cls.config.vocab_size), mlm_labels.view(-1))
-        loss = loss + cls.model_args.mlm_weight * masked_lm_loss
-
-    if for_watermark:
-        loss_1 = loss
-        
-        # Calculate loss for uniform perturbation and unbiased token preference
-        def sign_loss(x, factor):
-            smooth_sign = torch.tanh(x*factor)
-            row = torch.abs(torch.mean(torch.mean(smooth_sign, dim=0)))
-            col = torch.abs(torch.mean(torch.mean(smooth_sign, dim=1)))
-            return (row + col)/2
-        
-        loss_2 = sign_loss(z1, 1000)
-
-        # get sign value before calculating euclidean distance
-        z1_sign = torch.tanh(z1 * 1000)
-        z2_sign = torch.tanh(z2 * 1000)
-        z3_sign = torch.tanh(z3 * 1000)
-
-        # calculate loss_3: loss for distance between original and paraphrased text
-        loss_3 = torch.norm(z1_sign - z2_sign, dim=1)  # (bs)
-        loss_3 = torch.abs(loss_3).mean()
-
-        # calculate loss_4: loss for distance between original and negative text
-        loss_4 = torch.norm(z1_sign - z3_sign, dim=1)  # (bs)
-        loss_4 = - torch.abs(loss_4).mean()
-
-
-        loss = lambda_1 * loss_1 + lambda_2 * loss_2 + lambda_3 * loss_3 + lambda_4 * loss_4  # torch.clamp(loss_4, min=-4)
+    # calculate loss_3: loss for distance between original and negative text
+    loss_3 = torch.norm(z1_sign - z3_sign, dim=1)  # (bs)
+    loss_3 = - torch.abs(loss_3).mean()
+    
+    loss = lambda_1 * loss_1 + lambda_2 * loss_2 + lambda_3 * loss_3  # torch.clamp(loss_3, min=-1/cls.model_args.temp/2)
 
     result = {
         'loss': loss,
         'loss_1': loss_1,
         'loss_2': loss_2,
         'loss_3': loss_3,
-        'loss_4': loss_4,
-        'logits': cos_sim,
         'hidden_states': outputs.hidden_states,
         'attentions': outputs.attentions,
     }
     if not return_dict:
-        output = (cos_sim,) + outputs[2:]
+        output = outputs[2:]
         return ((loss,) + output) if loss is not None else output
     return result
 

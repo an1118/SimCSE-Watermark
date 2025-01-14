@@ -35,11 +35,12 @@ from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
 from simcse.models import RobertaForCL, BertForCL
-from simcse.trainers import CLTrainer
+from simcse.trainers import CLTrainer, LogCLTrainer
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+os.environ["WANDB_PROJECT"]="watermarking"
 
 @dataclass
 class ModelArguments:
@@ -122,6 +123,13 @@ class ModelArguments:
             "help": "Use MLP only during training"
         }
     )
+    freeze_roberta: bool = field(
+        default = False,
+        metadata={
+            "help": "Freeze roberta and following mlp if pooler type is 'cls'."
+        }
+    )
+    
 
 
 @dataclass
@@ -155,6 +163,10 @@ class DataTrainingArguments:
     train_file: Optional[str] = field(
         default=None, 
         metadata={"help": "The training data file (.txt or .csv)."}
+    )
+    validation_file: Optional[str] = field(
+        default=None, 
+        metadata={"help": "The validation data file (.txt or .csv)."}
     )
     max_seq_length: Optional[int] = field(
         default=32,
@@ -194,6 +206,31 @@ class OurTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
+    save_strategy: str = field(
+        default='steps',
+        metadata={"help": "ckpt save strategy"}
+    )
+    save_steps: int = field(
+        default=50,
+        metadata={"help": "how often to save a ckpt"},
+    )
+    report_to: Optional[str] = field(
+        default='wandb',
+        metadata={"help": "enable logging to W&B"},
+    )
+    run_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "name of the W&B run"},
+    )
+    logging_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "how often to log to W&B"},
+    )
+    label_names: Optional[str] = field(
+        default_factory=lambda: ["input_ids"],
+        metadata={"help": "label names."},
+    )
+
 
     @cached_property
     @torch_required
@@ -256,7 +293,6 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
     if (
         os.path.exists(training_args.output_dir)
         and os.listdir(training_args.output_dir)
@@ -302,6 +338,8 @@ def main():
     data_files = {}
     if data_args.train_file is not None:
         data_files["train"] = data_args.train_file
+    if data_args.validation_file is not None:
+        data_files["valid"] = data_args.validation_file
     extension = data_args.train_file.split(".")[-1]
     if extension == "txt":
         extension = "text"
@@ -358,6 +396,12 @@ def main():
                 use_auth_token=True if model_args.use_auth_token else None,
                 model_args=model_args                  
             )
+            if "twitter-roberta-base-sentiment" in model_args.model_name_or_path:
+                # Initialize MLP weights
+                from transformers import AutoModelForSequenceClassification
+                pretrained_model = AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path)
+                model.initialize_mlp_weights(pretrained_model)
+                print('Load mlp dense weights and bias from pretrained model!')
         elif 'bert' in model_args.model_name_or_path:
             model = BertForCL.from_pretrained(
                 model_args.model_name_or_path,
@@ -450,6 +494,14 @@ def main():
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
+    if training_args.do_eval:
+        eval_dataset = datasets["valid"].map(
+            prepare_features,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
     # Data collator
     @dataclass
@@ -531,10 +583,11 @@ def main():
 
     data_collator = default_data_collator if data_args.pad_to_max_length else OurDataCollatorWithPadding(tokenizer)
 
-    trainer = CLTrainer(
+    trainer = LogCLTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
@@ -565,7 +618,7 @@ def main():
     results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        results = trainer.evaluate(eval_senteval_transfer=True)
+        results = trainer.evaluate()
 
         output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
         if trainer.is_world_process_zero():

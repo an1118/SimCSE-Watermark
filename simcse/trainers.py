@@ -9,6 +9,8 @@ import shutil
 import time
 import warnings
 from pathlib import Path
+from typing import Dict, Literal
+from collections import defaultdict
 import importlib.util
 from packaging import version
 from transformers import Trainer
@@ -90,58 +92,58 @@ logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
 
-    def evaluate(
-        self,
-        eval_dataset: Optional[Dataset] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-        eval_senteval_transfer: bool = False,
-    ) -> Dict[str, float]:
+    # def evaluate(
+    #     self,
+    #     eval_dataset: Optional[Dataset] = None,
+    #     ignore_keys: Optional[List[str]] = None,
+    #     metric_key_prefix: str = "eval",
+    #     eval_senteval_transfer: bool = False,
+    # ) -> Dict[str, float]:
 
-        # SentEval prepare and batcher
-        def prepare(params, samples):
-            return
+    #     # SentEval prepare and batcher
+    #     def prepare(params, samples):
+    #         return
 
-        def batcher(params, batch):
-            sentences = [' '.join(s) for s in batch]
-            batch = self.tokenizer.batch_encode_plus(
-                sentences,
-                return_tensors='pt',
-                padding=True,
-            )
-            for k in batch:
-                batch[k] = batch[k].to(self.args.device)
-            with torch.no_grad():
-                outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                pooler_output = outputs.pooler_output
-            return pooler_output.cpu()
+    #     def batcher(params, batch):
+    #         sentences = [' '.join(s) for s in batch]
+    #         batch = self.tokenizer.batch_encode_plus(
+    #             sentences,
+    #             return_tensors='pt',
+    #             padding=True,
+    #         )
+    #         for k in batch:
+    #             batch[k] = batch[k].to(self.args.device)
+    #         with torch.no_grad():
+    #             outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+    #             pooler_output = outputs.pooler_output
+    #         return pooler_output.cpu()
 
-        # Set params for SentEval (fastmode)
-        params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
-        params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
-                                            'tenacity': 3, 'epoch_size': 2}
+    #     # Set params for SentEval (fastmode)
+    #     params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
+    #     params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
+    #                                         'tenacity': 3, 'epoch_size': 2}
 
-        se = senteval.engine.SE(params, batcher, prepare)
-        tasks = ['STSBenchmark', 'SICKRelatedness']
-        if eval_senteval_transfer or self.args.eval_transfer:
-            tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
-        self.model.eval()
-        results = se.eval(tasks)
+    #     se = senteval.engine.SE(params, batcher, prepare)
+    #     tasks = ['STSBenchmark', 'SICKRelatedness']
+    #     if eval_senteval_transfer or self.args.eval_transfer:
+    #         tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
+    #     self.model.eval()
+    #     results = se.eval(tasks)
         
-        stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
-        sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
+    #     stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
+    #     sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
 
-        metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
-        if eval_senteval_transfer or self.args.eval_transfer:
-            avg_transfer = 0
-            for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
-                avg_transfer += results[task]['devacc']
-                metrics['eval_{}'.format(task)] = results[task]['devacc']
-            avg_transfer /= 7
-            metrics['eval_avg_transfer'] = avg_transfer
+    #     metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
+    #     if eval_senteval_transfer or self.args.eval_transfer:
+    #         avg_transfer = 0
+    #         for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
+    #             avg_transfer += results[task]['devacc']
+    #             metrics['eval_{}'.format(task)] = results[task]['devacc']
+    #         avg_transfer /= 7
+    #         metrics['eval_avg_transfer'] = avg_transfer
 
-        self.log(metrics)
-        return metrics
+    #     self.log(metrics)
+    #     return metrics
         
     def _save_checkpoint(self, model, trial, metrics=None):
         """
@@ -557,3 +559,59 @@ class CLTrainer(Trainer):
         self._total_loss_scalar += tr_loss.item()
 
         return TrainOutput(self.state.global_step, self._total_loss_scalar / self.state.global_step, metrics)
+    
+
+class LogCLTrainer(CLTrainer):
+    def __init__(self, *args, **kwargs):
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        super().__init__(*args, **kwargs)
+
+    def store_metrics(self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
+        for key, value in metrics.items():
+            self._stored_metrics[train_eval][key].append(value)
+
+    def compute_loss(self, model, inputs):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        outputs = model(**inputs)
+        
+        metrics = {}
+        metrics.update({"loss_1": outputs['loss_1'].detach().cpu()})
+        metrics.update({"loss_2": outputs['loss_2'].detach().cpu()})
+        if 'loss_3' in outputs.keys():
+            metrics.update({"loss_3": outputs['loss_3'].detach().cpu()})
+        if 'loss_4' in outputs.keys():
+            metrics.update({"loss_4": outputs['loss_4'].detach().cpu()})
+        # force log the metrics
+        self.store_metrics(metrics, train_eval="train")
+
+        # Save past state if it exists
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if self.label_smoother is not None and "labels" in inputs:
+            return self.label_smoother(outputs, inputs["labels"])
+        else:
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            return outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+    def log(self, logs: Dict[str, float]) -> None:
+        """
+        Log :obj:`logs` on the various objects watching training.
+
+        Subclass and override this method to inject custom behavior.
+
+        Args:
+            logs (:obj:`Dict[str, float]`):
+                The values to log.
+        """
+        # logs either has 'loss' or 'eval_loss'
+        train_eval = "train" if "loss" in logs else "eval"
+        # Add averaged stored metrics to logs
+        for key, metrics in self._stored_metrics[train_eval].items():
+            logs[key] = torch.tensor(metrics).mean().item()
+        del self._stored_metrics[train_eval]
+        return super().log(logs)
