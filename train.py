@@ -34,7 +34,7 @@ from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy,
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models import RobertaForCL, BertForCL
+from simcse.models_cl1 import RobertaForCL, BertForCL
 from simcse.trainers import CLTrainer, LogCLTrainer
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,6 @@ def main():
             f"Output directory ({training_args.output_dir}) already exists and is not empty."
             "Use --overwrite_output_dir to overcome."
         )
-
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -426,7 +425,7 @@ def main():
 
     # Prepare features
     column_names = datasets["train"].column_names
-    sent2_cname = None
+    sent2_cname, sent3_cname = None, None
     if len(column_names) == 2:
         # Pair datasets
         sent0_cname = column_names[0]
@@ -436,6 +435,12 @@ def main():
         sent0_cname = column_names[0]
         sent1_cname = column_names[1]
         sent2_cname = column_names[2]
+    elif len(column_names) == 4:
+        # Pair datasets with two hard negatives
+        sent0_cname = column_names[0]
+        sent1_cname = column_names[1]
+        sent2_cname = column_names[2]
+        sent3_cname = column_names[3]
     elif len(column_names) == 1:
         # Unsupervised datasets
         sent0_cname = column_names[0]
@@ -463,12 +468,14 @@ def main():
         sentences = examples[sent0_cname] + examples[sent1_cname]
 
         # If hard negative exists
-        if sent2_cname is not None:
-            for idx in range(total):
-                if examples[sent2_cname][idx] is None:
-                    examples[sent2_cname][idx] = " "
-            sentences += examples[sent2_cname]
+        for neg in [sent2_cname, sent3_cname]:
+            if neg is not None:
+                for idx in range(total):
+                    if examples[neg][idx] is None:
+                        examples[neg][idx] = " "
+                sentences += examples[neg]
 
+        # TODO: support two hard negatives, modify code afterwards
         sent_features = tokenizer(
             sentences,
             max_length=data_args.max_seq_length,

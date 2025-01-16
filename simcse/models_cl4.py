@@ -145,8 +145,6 @@ def cl_forward(cls,
     for_watermark=True,  # TODO: these three parameters didn't pass
     lambda_1=1.0,
     lambda_2=1.0,
-    lambda_3=0.0,
-    lambda_4=0.0,
 ):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
@@ -236,11 +234,47 @@ def cl_forward(cls,
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
 
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
-    # Hard negative
-    if num_sent >= 3:
-        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
-        cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)  # (bs, bs*2)
+    # straight-through estimate sign function
+    def sign_ste(x):
+        x_nogradient = x.detach()
+        return x + x.sign() - x_nogradient
+    
+    # get sign value before calculating loss!
+    z1 = torch.tanh(z1 * 1000)
+    z2 = torch.tanh(z2 * 1000)
+    z3 = torch.tanh(z3 * 1000)
+
+    # z1 = sign_ste(z1)
+    # z2 = sign_ste(z2)
+    # z3 = sign_ste(z3)
+
+    # contrastive loss:
+    # \[
+    # L_{cl4} = \sum_{i=1}^{N}-log\frac{e^{sim(g_{i},g^{+}_{i})/\tau}}
+    # {   \sum_{\substack{j=1 \\ j\neq i}}^{N}e^{sim(g_{i},g_{j})/\tau}
+    #     + \sum_{j=1}^{N}(e^{sim(g_{i},g^{+}_{j})/\tau}
+    #         + \alpha^{\mathbb{1}_i^j}*e^{sim(g_{i},g^{-}_{j})/\tau})
+    # } \]
+
+    def remove_diagonal_elements(input_tensor):
+        """
+        Removes the diagonal elements from a square matrix (bs, bs) 
+        and returns a new matrix of size (bs, bs-1).
+        """
+        if input_tensor.size(0) != input_tensor.size(1):
+            raise ValueError("Input tensor must be square (bs, bs).")
+        
+        bs = input_tensor.size(0)
+        mask = ~torch.eye(bs, dtype=torch.bool, device=input_tensor.device)  # Mask for non-diagonal elements
+        output_tensor = input_tensor[mask].view(bs, bs - 1)  # Reshape into (bs, bs-1)
+        return output_tensor
+
+    z1_z1_cos = cls.sim(z1.unsqueeze(1), z1.unsqueeze(0))  # (bs, bs)
+    z1_z1_cos_removed = remove_diagonal_elements(z1_z1_cos)  # (bs, bs-1)
+    z1_z2_cos = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
+    z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))  # (bs,bs)
+
+    cos_sim = torch.cat([z1_z2_cos, z1_z1_cos_removed, z1_z3_cos], 1)  # (bs, 3*bs-1)
 
     labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
     loss_fct = nn.CrossEntropyLoss()
@@ -250,12 +284,11 @@ def cl_forward(cls,
         # Note that weights are actually logits of weights
         z3_weight = cls.model_args.hard_negative_weight
         weights = torch.tensor(
-            [[0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1)) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(-1))]
+            [[0.0] * z1_z2_cos.size(-1) + [0.0] * z1_z1_cos_removed.size(-1) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(0))]
         ).to(cls.device)
         cos_sim = cos_sim + weights
 
     loss = loss_fct(cos_sim, labels)
-
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
@@ -267,29 +300,24 @@ def cl_forward(cls,
         loss_1 = loss
         
         # Calculate loss for uniform perturbation and unbiased token preference
-        def sign_loss(x, factor):
-            smooth_sign = torch.tanh(x*factor)
-            row = torch.abs(torch.mean(torch.mean(smooth_sign, dim=0)))
-            col = torch.abs(torch.mean(torch.mean(smooth_sign, dim=1)))
+        def sign_loss(x):
+            # smooth_sign = sign_ste(x)
+            row = torch.abs(torch.mean(torch.mean(x, dim=0)))
+            col = torch.abs(torch.mean(torch.mean(x, dim=1)))
             return (row + col)/2
-        
-        loss_2 = sign_loss(z1, 1000)
 
-        # get sign value before calculating euclidean distance
-        z1_sign = torch.tanh(z1 * 1000)
-        z2_sign = torch.tanh(z2 * 1000)
-        z3_sign = torch.tanh(z3 * 1000)
+        loss_2 = sign_loss(z1)
 
-        # calculate loss_3: loss for distance between original and paraphrased text
-        loss_3 = torch.norm(z1_sign - z2_sign, dim=1)  # (bs)
-        loss_3 = torch.abs(loss_3).mean()
+        # calculate loss_3: similarity between original and paraphrased text
+        loss_3 = cls.sim(z1, z2)  # (bs)
+        loss_3 = - loss_3.mean()
 
-        # calculate loss_4: loss for distance between original and negative text
-        loss_4 = torch.norm(z1_sign - z3_sign, dim=1)  # (bs)
-        loss_4 = - torch.abs(loss_4).mean()
+        # calculate loss_4: similarity between original and negative text
+        loss_4 = cls.sim(z1, z3)  # (bs)
+        loss_4 = loss_4.mean()
 
 
-        loss = lambda_1 * loss_1 + lambda_2 * loss_2 + lambda_3 * loss_3 + lambda_4 * loss_4  # torch.clamp(loss_4, min=-4)
+        loss = lambda_1 * loss_1 + lambda_2 * loss_2
 
     result = {
         'loss': loss,
