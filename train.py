@@ -33,9 +33,12 @@ from transformers import (
 from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
-from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models_cl1 import RobertaForCL, BertForCL
-from simcse.trainers import CLTrainer, LogCLTrainer
+from transformers.utils import cached_property, is_torch_tpu_available, requires_backends, is_accelerate_available
+from simcse.models import RobertaForCL
+from simcse.trainers import LogCLTrainer
+
+if is_accelerate_available():
+    from accelerate.state import PartialState
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -127,6 +130,12 @@ class ModelArguments:
         default = False,
         metadata={
             "help": "Freeze roberta and following mlp if pooler type is 'cls'."
+        }
+    )
+    loss_function_id: int = field(
+        default = 1,
+        metadata={
+            "help": "The index of the loss function."
         }
     )
     
@@ -230,11 +239,15 @@ class OurTrainingArguments(TrainingArguments):
         default_factory=lambda: ["input_ids"],
         metadata={"help": "label names."},
     )
+    distributed_state: Optional[PartialState] = field(
+        default=None,
+        metadata={"help": "label names."},
+    )
 
 
     @cached_property
-    @torch_required
     def _setup_devices(self) -> "torch.device":
+        requires_backends(self, ["torch"])
         logger.info("PyTorch: setting up devices")
         if self.no_cuda:
             device = torch.device("cpu")
@@ -401,19 +414,19 @@ def main():
                 pretrained_model = AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path)
                 model.initialize_mlp_weights(pretrained_model)
                 print('Load mlp dense weights and bias from pretrained model!')
-        elif 'bert' in model_args.model_name_or_path:
-            model = BertForCL.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                model_args=model_args
-            )
-            if model_args.do_mlm:
-                pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
-                model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
+        # elif 'bert' in model_args.model_name_or_path:
+        #     model = BertForCL.from_pretrained(
+        #         model_args.model_name_or_path,
+        #         from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        #         config=config,
+        #         cache_dir=model_args.cache_dir,
+        #         revision=model_args.model_revision,
+        #         use_auth_token=True if model_args.use_auth_token else None,
+        #         model_args=model_args
+        #     )
+        #     if model_args.do_mlm:
+        #         pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
+        #         model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
         else:
             raise NotImplementedError
     else:

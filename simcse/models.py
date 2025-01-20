@@ -7,6 +7,7 @@ import transformers
 from transformers import RobertaTokenizer
 from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
+from transformers.models.qwen2.modeling_qwen2 import Qwen2PreTrainedModel, Qwen2Model
 from transformers.activations import gelu
 from transformers.file_utils import (
     add_code_sample_docstrings,
@@ -248,55 +249,111 @@ def cl_forward(cls,
     # z2 = sign_ste(z2)
     # z3 = sign_ste(z3)
 
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
-    # Hard negative
-    if num_sent >= 3:
-        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
-        cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)  # (bs, bs*2)
+    # Compute contrastive loss
+    def remove_diagonal_elements(input_tensor):
+        """
+        Removes the diagonal elements from a square matrix (bs, bs) 
+        and returns a new matrix of size (bs, bs-1).
+        """
+        if input_tensor.size(0) != input_tensor.size(1):
+            raise ValueError("Input tensor must be square (bs, bs).")
+        
+        bs = input_tensor.size(0)
+        mask = ~torch.eye(bs, dtype=torch.bool, device=input_tensor.device)  # Mask for non-diagonal elements
+        output_tensor = input_tensor[mask].view(bs, bs - 1)  # Reshape into (bs, bs-1)
+        return output_tensor
 
-    labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    loss_fct = nn.CrossEntropyLoss()
+    z3_weight = cls.model_args.hard_negative_weight
 
-    # Calculate loss with hard negatives
-    if num_sent == 3:
+    if cls.model_args.loss_function_id == 1:
+        z1_z2_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
+        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))  # (bs, bs)
+        cos_sim = torch.cat([z1_z2_sim, z1_z3_cos], 1)  # (bs, bs*2)
+
+        labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
+        loss_fct = nn.CrossEntropyLoss()
+
+        # Calculate loss with hard negatives
         # Note that weights are actually logits of weights
-        z3_weight = cls.model_args.hard_negative_weight
         weights = torch.tensor(
-            [[0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1)) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(-1))]
+            [[0.0] * z1_z2_sim.size(-1) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(cos_sim.size(0))]
         ).to(cls.device)
-        cos_sim = cos_sim + weights
+    elif cls.model_args.loss_function_id == 2:
+        z1_z1_cos = cls.sim(z1.unsqueeze(1), z1.unsqueeze(0))  # (bs, bs)
+        z1_z1_cos_removed = remove_diagonal_elements(z1_z1_cos)  # (bs, bs-1)
+        z1_z2_cos = cls.sim(z1, z2).unsqueeze(1)  # (bs, 1)
+        z1_z3_cos = cls.sim(z1, z3).unsqueeze(1)  # (bs,1)
 
-    loss = loss_fct(cos_sim, labels)
+        cos_sim = torch.cat([z1_z2_cos, z1_z1_cos_removed, z1_z3_cos], 1)  # (bs, bs+1)
+
+        labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
+        labels = torch.zeros_like(labels).to(cls.device)
+        loss_fct = nn.CrossEntropyLoss()
+
+        # Calculate loss with hard negatives
+        weights = torch.tensor(
+            [[0.0] * z1_z2_cos.size(-1) + [0.0] * z1_z1_cos_removed.size(-1) + [z3_weight] for i in range(cos_sim.size(0))]
+        ).to(cls.device)
+    elif cls.model_args.loss_function_id == 3:
+        z1_z1_cos = cls.sim(z1.unsqueeze(1), z1.unsqueeze(0))  # (bs, bs)
+        z1_z1_cos_removed = remove_diagonal_elements(z1_z1_cos)  # (bs, bs-1)
+        z1_z2_cos = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
+        z1_z3_cos = cls.sim(z1, z3).unsqueeze(1)  # (bs,1)
+
+        cos_sim = torch.cat([z1_z2_cos, z1_z1_cos_removed, z1_z3_cos], 1)  # (bs, 2*bs)
+
+        labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
+        loss_fct = nn.CrossEntropyLoss()
+
+        # Calculate loss with hard negatives
+        weights = torch.tensor(
+            [[0.0] * z1_z2_cos.size(-1) + [0.0] * z1_z1_cos_removed.size(-1) + [z3_weight] for i in range(cos_sim.size(0))]
+        ).to(cls.device)
+    elif cls.model_args.loss_function_id == 4:
+        z1_z1_cos = cls.sim(z1.unsqueeze(1), z1.unsqueeze(0))  # (bs, bs)
+        z1_z1_cos_removed = remove_diagonal_elements(z1_z1_cos)  # (bs, bs-1)
+        z1_z2_cos = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # (bs, bs)
+        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))  # (bs,bs)
+
+        cos_sim = torch.cat([z1_z2_cos, z1_z1_cos_removed, z1_z3_cos], 1)  # (bs, 3*bs-1)
+
+        labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
+        loss_fct = nn.CrossEntropyLoss()
+
+        # Calculate loss with hard negatives
+        weights = torch.tensor(
+            [[0.0] * z1_z2_cos.size(-1) + [0.0] * z1_z1_cos_removed.size(-1) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(cos_sim.size(0))]
+        ).to(cls.device)
+
+    cos_sim = cos_sim + weights
+    loss_1 = loss_fct(cos_sim, labels)
 
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
         prediction_scores = cls.lm_head(mlm_outputs.last_hidden_state)
         masked_lm_loss = loss_fct(prediction_scores.view(-1, cls.config.vocab_size), mlm_labels.view(-1))
-        loss = loss + cls.model_args.mlm_weight * masked_lm_loss
+        loss_1 = loss_1 + cls.model_args.mlm_weight * masked_lm_loss
+    
+    # Calculate loss for uniform perturbation and unbiased token preference
+    def sign_loss(x):
+        # smooth_sign = sign_ste(x)
+        row = torch.abs(torch.mean(torch.mean(x, dim=0)))
+        col = torch.abs(torch.mean(torch.mean(x, dim=1)))
+        return (row + col)/2
 
-    if for_watermark:
-        loss_1 = loss
-        
-        # Calculate loss for uniform perturbation and unbiased token preference
-        def sign_loss(x):
-            # smooth_sign = sign_ste(x)
-            row = torch.abs(torch.mean(torch.mean(x, dim=0)))
-            col = torch.abs(torch.mean(torch.mean(x, dim=1)))
-            return (row + col)/2
+    loss_2 = sign_loss(z1)
 
-        loss_2 = sign_loss(z1)
+    # calculate loss_3: similarity between original and paraphrased text
+    loss_3 = cls.sim(z1, z2)  # (bs)
+    loss_3 = - loss_3.mean()
 
-        # calculate loss_3: similarity between original and paraphrased text
-        loss_3 = cls.sim(z1, z2)  # (bs)
-        loss_3 = - loss_3.mean()
-
-        # calculate loss_4: similarity between original and negative text
-        loss_4 = cls.sim(z1, z3)  # (bs)
-        loss_4 = loss_4.mean()
+    # calculate loss_4: similarity between original and negative text
+    loss_4 = cls.sim(z1, z3)  # (bs)
+    loss_4 = loss_4.mean()
 
 
-        loss = lambda_1 * loss_1 + lambda_2 * loss_2
+    loss = lambda_1 * loss_1 + lambda_2 * loss_2
 
     result = {
         'loss': loss,
@@ -425,7 +482,6 @@ class BertForCL(BertPreTrainedModel):
             )
 
 
-
 class RobertaForCL(RobertaPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
@@ -433,6 +489,9 @@ class RobertaForCL(RobertaPreTrainedModel):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
         self.roberta = RobertaModel(config, add_pooling_layer=False)
+        # import pdb
+        # pdb.set_trace()
+        # self.embed = RobertaForSequenceClassification(config)
 
         if self.model_args.do_mlm:
             self.lm_head = RobertaLMHead(config)
@@ -496,16 +555,16 @@ class RobertaForCL(RobertaPreTrainedModel):
                 mlm_labels=mlm_labels,
             )
 
-class Qwen2ForCL(RobertaPreTrainedModel):
+class Qwen2ForCL(Qwen2PreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def __init__(self, config, *model_args, **model_kargs):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
-        self.roberta = RobertaModel(config, add_pooling_layer=False)
+        self.embed = Qwen2Model(config, add_pooling_layer=False)
 
-        if self.model_args.do_mlm:
-            self.lm_head = RobertaLMHead(config)
+        # if self.model_args.do_mlm:
+        #     self.lm_head = RobertaLMHead(config)
 
         cl_init(self, config)
         self.map = SemanticModel()
@@ -565,3 +624,4 @@ class Qwen2ForCL(RobertaPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
             )
+
