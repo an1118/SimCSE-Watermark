@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch import Tensor
 
 import transformers
 from transformers import RobertaTokenizer
-from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
+from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead, RobertaForSequenceClassification
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
 from transformers.models.qwen2.modeling_qwen2 import Qwen2PreTrainedModel, Qwen2Model
 from transformers.activations import gelu
@@ -119,18 +120,18 @@ def cl_init(cls, config):
     """
     Contrastive learning class init function.
     """
-    cls.pooler_type = cls.model_args.pooler_type
-    cls.pooler = Pooler(cls.model_args.pooler_type)
-    if cls.model_args.pooler_type == "cls":
-        cls.mlp = MLPLayer(config)
-        if cls.model_args.freeze_roberta:
-            for param in cls.mlp.parameters():
-                param.requires_grad = False
+    if 'roberta' in cls.model_args.model_name_or_path:
+        cls.pooler_type = cls.model_args.pooler_type
+        cls.pooler = Pooler(cls.model_args.pooler_type)
+        if cls.model_args.pooler_type == "cls":
+            cls.mlp = MLPLayer(config)
+            if cls.model_args.freeze_embed:
+                for param in cls.mlp.parameters():
+                    param.requires_grad = False
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
 
 def cl_forward(cls,
-    encoder,
     input_ids=None,
     attention_mask=None,
     token_type_ids=None,
@@ -143,10 +144,39 @@ def cl_forward(cls,
     return_dict=None,
     mlm_input_ids=None,
     mlm_labels=None,
-    for_watermark=True,  # TODO: these three parameters didn't pass
     lambda_1=1.0,
     lambda_2=1.0,
 ):
+    # debug: get the edit distance between original & paraphrased
+    import Levenshtein
+
+    def apply_attention_mask(tensor, attention_mask):
+        """
+        Returns:
+            list: A list of tensors, where each tensor contains the valid tokens for one batch entry.
+        """
+        batch_size = tensor.size(0)
+        result = []
+        for i in range(batch_size):
+            # Masked tokens for this batch entry
+            valid_tokens = tensor[i][attention_mask[i].bool()]
+            result.append(valid_tokens)
+        return result
+    
+    original = input_ids[:,0,:].squeeze(1)
+    original_mask = attention_mask[:,0,:].squeeze(1)
+    original = apply_attention_mask(original, original_mask)
+    paraphrased = input_ids[:,1,:].squeeze(1)
+    paraphrased_mask = attention_mask[:,1,:].squeeze(1)
+    paraphrased = apply_attention_mask(paraphrased, paraphrased_mask)
+    # compute edit distance
+    valid_for_loss3 = []
+    for i in range(len(original)):
+        edit_distance = Levenshtein.distance(original[i].tolist(), paraphrased[i].tolist()) / len(original[i])
+        valid_for_loss3.append(1 if edit_distance >= 0.2 else 0)
+    valid_for_loss3 = torch.tensor(valid_for_loss3)
+    # finish debug
+
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
     batch_size = input_ids.size(0)
@@ -161,24 +191,12 @@ def cl_forward(cls,
     if token_type_ids is not None:
         token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
 
-    # Get raw embeddings
-    outputs = encoder(
-        input_ids,
-        attention_mask=attention_mask,
-        token_type_ids=token_type_ids,
-        position_ids=position_ids,
-        head_mask=head_mask,
-        inputs_embeds=inputs_embeds,
-        output_attentions=output_attentions,
-        output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-        return_dict=True,
-    )
-
-    # MLM auxiliary objective
-    if mlm_input_ids is not None:
-        mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
-        mlm_outputs = encoder(
-            mlm_input_ids,
+    
+    
+    if 'roberta' in cls.model_args.model_name_or_path:
+        # Get raw embeddings
+        outputs = cls.roberta(
+            input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -189,20 +207,68 @@ def cl_forward(cls,
             return_dict=True,
         )
 
-    # Pooling
-    pooler_output = cls.pooler(attention_mask, outputs)
-    pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
+        # MLM auxiliary objective
+        if mlm_input_ids is not None:
+            mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
+            mlm_outputs = cls.roberta(
+                mlm_input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+                return_dict=True,
+            )
 
-    # If using "cls", we add an extra MLP layer
-    # (same as BERT's original implementation) over the representation.
-    if cls.pooler_type == "cls":
-        pooler_output = cls.mlp(pooler_output)
+        # Pooling
+        pooler_output = cls.pooler(attention_mask, outputs)
+        pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
 
-    if for_watermark:
-        # Mapping
-        mapping_output = cls.map(pooler_output)
-        # mapping_output = torch.tanh(mapping_output * 1000)  # approximate sign function
-        pooler_output = mapping_output
+        # If using "cls", we add an extra MLP layer
+        # (same as BERT's original implementation) over the representation.
+        if cls.pooler_type == "cls":
+            pooler_output = cls.mlp(pooler_output)
+    elif 'qwen2' in cls.model_args.model_name_or_path.lower():
+        def last_token_pool(last_hidden_states: Tensor,
+                        attention_mask: Tensor) -> Tensor:
+            left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+            if left_padding:
+                return last_hidden_states[:, -1]
+            else:
+                sequence_lengths = attention_mask.sum(dim=1) - 1
+                batch_size = last_hidden_states.shape[0]
+                return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
+
+        outputs = cls.model(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+            return_dict=True,
+        )
+
+        pooler_output = last_token_pool(outputs.last_hidden_state, attention_mask)
+        # normalize embeddings
+        pooler_output = F.normalize(pooler_output, p=2, dim=1)
+        
+        # last_unmasked_token_idx = (attention_mask == 1).long().sum(dim=1) - 1
+        # # last_unmasked_token_idx = last_unmasked_token_idx.tolist()
+        # last_hidden_state = outputs['last_hidden_state']  # (bs*num_sent, seq_len, hidden_states)
+        # pooler_output = last_hidden_state[torch.arange(last_hidden_state.size(0)), last_unmasked_token_idx] # last unmasked token's hiddent state
+        pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1)))  # (bs, num_sent, hidden_states)
+    else:
+        raise NotImplementedError
+    
+    # Mapping
+    mapping_output = cls.map(pooler_output)
+    # mapping_output = torch.tanh(mapping_output * 1000)  # approximate sign function
+    pooler_output = mapping_output
         
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
@@ -346,6 +412,9 @@ def cl_forward(cls,
 
     # calculate loss_3: similarity between original and paraphrased text
     loss_3 = cls.sim(z1, z2)  # (bs)
+
+    # debug: 
+    loss_3 = loss_3[valid_for_loss3.bool()]
     loss_3 = - loss_3.mean()
 
     # calculate loss_4: similarity between original and negative text
@@ -373,7 +442,6 @@ def cl_forward(cls,
 
 def sentemb_forward(
     cls,
-    encoder,
     input_ids=None,
     attention_mask=None,
     token_type_ids=None,
@@ -384,34 +452,61 @@ def sentemb_forward(
     output_attentions=None,
     output_hidden_states=None,
     return_dict=None,
-    for_watermark=True,  # TODO: these three parameters didn't pass
     lambda_1=1.0,
     lambda_2=1.0,
 ):
 
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
 
-    outputs = encoder(
-        input_ids,
-        attention_mask=attention_mask,
-        token_type_ids=token_type_ids,
-        position_ids=position_ids,
-        head_mask=head_mask,
-        inputs_embeds=inputs_embeds,
-        output_attentions=output_attentions,
-        output_hidden_states=True if cls.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-        return_dict=True,
-    )
+    if 'roberta' in cls.model_args.model_name_or_path:
+        outputs = cls.roberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True if cls.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+            return_dict=True,
+        )
 
-    pooler_output = cls.pooler(attention_mask, outputs)
-    if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
-        pooler_output = cls.mlp(pooler_output)
+        pooler_output = cls.pooler(attention_mask, outputs)
+        if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
+            pooler_output = cls.mlp(pooler_output)
+    elif 'qwen2' in cls.model_args.model_name_or_path:
+        def last_token_pool(last_hidden_states: Tensor,
+                        attention_mask: Tensor) -> Tensor:
+            left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+            if left_padding:
+                return last_hidden_states[:, -1]
+            else:
+                sequence_lengths = attention_mask.sum(dim=1) - 1
+                batch_size = last_hidden_states.shape[0]
+                return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
 
-    if for_watermark:
-        # Mapping
-        mapping_output = cls.map(pooler_output)
-        # mapping_output = torch.tanh(mapping_output * 1000)  # approximate sign function  # todo: delete
-        pooler_output = mapping_output
+        outputs = cls.model(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        pooler_output = last_token_pool(outputs.last_hidden_state, attention_mask)
+        # normalize embeddings
+        pooler_output = F.normalize(pooler_output, p=2, dim=1)
+        import pdb
+        pdb.set_trace()
+
+
+    # Mapping
+    mapping_output = cls.map(pooler_output)
+    # mapping_output = torch.tanh(mapping_output * 1000)  # approximate sign function  # todo: delete
+    pooler_output = mapping_output
         
 
     if not return_dict:
@@ -422,64 +517,6 @@ def sentemb_forward(
         last_hidden_state=outputs.last_hidden_state,
         hidden_states=outputs.hidden_states,
     )
-
-
-class BertForCL(BertPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
-    def __init__(self, config, *model_args, **model_kargs):
-        super().__init__(config)
-        self.model_args = model_kargs["model_args"]
-        self.bert = BertModel(config, add_pooling_layer=False)
-
-        if self.model_args.do_mlm:
-            self.lm_head = BertLMPredictionHead(config)
-
-        cl_init(self, config)
-
-    def forward(self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        sent_emb=False,
-        mlm_input_ids=None,
-        mlm_labels=None,
-    ):
-        if sent_emb:
-            return sentemb_forward(self, self.bert,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        else:
-            return cl_forward(self, self.bert,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                mlm_input_ids=mlm_input_ids,
-                mlm_labels=mlm_labels,
-            )
 
 
 class RobertaForCL(RobertaPreTrainedModel):
@@ -497,9 +534,9 @@ class RobertaForCL(RobertaPreTrainedModel):
             self.lm_head = RobertaLMHead(config)
 
         cl_init(self, config)
-        self.map = SemanticModel()
+        self.map = SemanticModel(input_dim=768)
 
-        if self.model_args.freeze_roberta:
+        if self.model_args.freeze_embed:
             # Freeze RoBERTa encoder parameters
             for param in self.roberta.parameters():
                 param.requires_grad = False
@@ -527,7 +564,7 @@ class RobertaForCL(RobertaPreTrainedModel):
         mlm_labels=None,
     ):
         if sent_emb:
-            return sentemb_forward(self, self.roberta,
+            return sentemb_forward(self,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -540,7 +577,7 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, self.roberta,
+            return cl_forward(self,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -561,25 +598,18 @@ class Qwen2ForCL(Qwen2PreTrainedModel):
     def __init__(self, config, *model_args, **model_kargs):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
-        self.embed = Qwen2Model(config, add_pooling_layer=False)
+        self.model = Qwen2Model(config)
 
         # if self.model_args.do_mlm:
         #     self.lm_head = RobertaLMHead(config)
 
         cl_init(self, config)
-        self.map = SemanticModel()
+        self.map = SemanticModel(input_dim=1536)
 
-        if self.model_args.freeze_roberta:
-            # Freeze RoBERTa encoder parameters
-            for param in self.roberta.parameters():
+        if self.model_args.freeze_embed:
+            # Freeze Qwen parameters
+            for param in self.model.parameters():
                 param.requires_grad = False
-
-    def initialize_mlp_weights(self, pretrained_model_state_dict):
-        """
-        Initialize MLP weights using the pretrained classifier's weights.
-        """
-        self.mlp.dense.weight.data = pretrained_model_state_dict.classifier.dense.weight.data.clone()
-        self.mlp.dense.bias.data = pretrained_model_state_dict.classifier.dense.bias.data.clone()
 
     def forward(self,
         input_ids=None,
@@ -597,7 +627,7 @@ class Qwen2ForCL(Qwen2PreTrainedModel):
         mlm_labels=None,
     ):
         if sent_emb:
-            return sentemb_forward(self, self.roberta,
+            return sentemb_forward(self,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -610,7 +640,7 @@ class Qwen2ForCL(Qwen2PreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, self.roberta,
+            return cl_forward(self,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,

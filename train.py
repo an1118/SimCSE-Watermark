@@ -34,7 +34,7 @@ from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy,
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.utils import cached_property, is_torch_tpu_available, requires_backends, is_accelerate_available
-from simcse.models import RobertaForCL
+from simcse.models import RobertaForCL, Qwen2ForCL
 from simcse.trainers import LogCLTrainer
 
 if is_accelerate_available():
@@ -126,7 +126,7 @@ class ModelArguments:
             "help": "Use MLP only during training"
         }
     )
-    freeze_roberta: bool = field(
+    freeze_embed: bool = field(
         default = False,
         metadata={
             "help": "Freeze roberta and following mlp if pooler type is 'cls'."
@@ -408,25 +408,22 @@ def main():
                 use_auth_token=True if model_args.use_auth_token else None,
                 model_args=model_args                  
             )
-            if "twitter-roberta-base-sentiment" in model_args.model_name_or_path:
-                # Initialize MLP weights
-                from transformers import AutoModelForSequenceClassification
-                pretrained_model = AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path)
-                model.initialize_mlp_weights(pretrained_model)
-                print('Load mlp dense weights and bias from pretrained model!')
-        # elif 'bert' in model_args.model_name_or_path:
-        #     model = BertForCL.from_pretrained(
-        #         model_args.model_name_or_path,
-        #         from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        #         config=config,
-        #         cache_dir=model_args.cache_dir,
-        #         revision=model_args.model_revision,
-        #         use_auth_token=True if model_args.use_auth_token else None,
-        #         model_args=model_args
-        #     )
-        #     if model_args.do_mlm:
-        #         pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
-        #         model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
+            # if "twitter-roberta-base-sentiment" in model_args.model_name_or_path:
+            #     # Initialize MLP weights
+            #     from transformers import AutoModelForSequenceClassification
+            #     pretrained_model = AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path)
+            #     model.initialize_mlp_weights(pretrained_model)
+            #     print('Load mlp dense weights and bias from pretrained model!')
+        elif 'qwen2' in model_args.model_name_or_path.lower():
+            model = Qwen2ForCL.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+                model_args=model_args                  
+            )
         else:
             raise NotImplementedError
     else:

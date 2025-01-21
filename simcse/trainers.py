@@ -595,7 +595,11 @@ class LogCLTrainer(Trainer):
         if 'loss_4' in outputs.keys():
             metrics.update({"loss_4": outputs['loss_4'].detach().cpu()})
         # force log the metrics
-        self.store_metrics(metrics, train_eval="train")
+        if model.training:
+            mode = "train"
+        else:
+            mode = "eval"
+        self.store_metrics(metrics, train_eval=mode)
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -646,6 +650,8 @@ class LogCLTrainer(Trainer):
         train_eval = "train" if "loss" in logs else "eval"
         # Add averaged stored metrics to logs
         for key, metrics in self._stored_metrics[train_eval].items():
+            if train_eval == 'eval':
+                key = 'eval_'+key
             logs[key] = torch.tensor(metrics).mean().item()
         del self._stored_metrics[train_eval]
         return super().log(logs, start_time)

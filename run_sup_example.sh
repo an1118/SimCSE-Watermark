@@ -12,23 +12,27 @@ PORT_ID=$(expr $RANDOM + 1000)
 # Allow multiple threads
 export OMP_NUM_THREADS=8
 
-HARD_NEGATIVE_WEIGHT=$(python3 -c "import math; print(math.log(128))")
+model_name="Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+model_name_="${model_name#*/}"
+loss_function_id=2
+neg_weight=64
+HARD_NEGATIVE_WEIGHT=$(python3 -c "import math; print(math.log(${neg_weight}))")
 
 # Use distributed data parallel
 # If you only want to use one card, uncomment the following line and comment the line with "torch.distributed.launch"
 # CUDA_VISIBLE_DEVICES=1 python -m torch.distributed.launch --nproc_per_node $NUM_GPU --master_port $PORT_ID train.py \
 
-CUDA_VISIBLE_DEVICES=5 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file simcse_config.yaml train.py \
-    --model_name_or_path cardiffnlp/twitter-roberta-base-sentiment \
+CUDA_VISIBLE_DEVICES=3 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file simcse_config.yaml train.py \
+    --model_name_or_path Alibaba-NLP/gte-Qwen2-1.5B-instruct \
     --train_file /mnt/data2/lian/projects/watermark/data/c4-train-simcse-all-filtered-formatted.csv \
     --validation_file /mnt/data2/lian/projects/watermark/data/c4-test-simcse-all-filtered-formatted.csv \
-    --output_dir result/test-end2end-simcse-roberta-sentiment-c4-loss_cl1_gr-wneg128 \
+    --output_dir result/end2end-simcse-${model_name_}-c4-loss_cl${loss_function_id}_gr-wneg${neg_weight}-freeze \
     --hard_negative_weight $HARD_NEGATIVE_WEIGHT \
-    --loss_function_id 1 \
+    --loss_function_id  ${loss_function_id} \
     --num_train_epochs 30 \
     --per_device_train_batch_size 64 \
     --per_device_eval_batch_size 64 \
-    --learning_rate 3e-5 \
+    --learning_rate 5e-5 \
     --max_seq_length 320 \
     --evaluation_strategy steps \
     --save_strategy best \
@@ -43,9 +47,9 @@ CUDA_VISIBLE_DEVICES=5 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file
     --do_eval \
     --fp16 \
     --report_to="wandb" \
-    --run_name="test-wm-simcse-roberta-sentiment-c4-loss_cl1_gr-wneg128" \
+    --run_name="wm-simcse-${model_name_}-c4-loss_cl${loss_function_id}_gr-wneg${neg_weight}-freeze" \
     --logging_steps=1 \
+    --freeze_embed \
     "$@"
     # --gradient_accumulation_steps 16 \
-    # --freeze_roberta
     # --load_best_model_at_end \
